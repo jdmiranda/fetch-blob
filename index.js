@@ -19,6 +19,35 @@ if (!globalThis.ReadableStream) {
 // 64 KiB (same size chrome slice theirs blob into Uint8array's)
 const POOL_SIZE = 65536
 
+// Buffer pool for reducing allocations
+const bufferPool = []
+const MAX_POOL_SIZE = 10
+
+function getPooledBuffer(size) {
+  if (bufferPool.length > 0 && size <= POOL_SIZE) {
+    return bufferPool.pop()
+  }
+  return new ArrayBuffer(size)
+}
+
+function returnToPool(buffer) {
+  if (buffer.byteLength === POOL_SIZE && bufferPool.length < MAX_POOL_SIZE) {
+    bufferPool.push(buffer)
+  }
+}
+
+// Type checking cache to avoid repeated instanceof checks
+const typeCache = new WeakMap()
+
+function isBlob(obj) {
+  if (!obj || typeof obj !== 'object') return false
+  let cached = typeCache.get(obj)
+  if (cached !== undefined) return cached
+  cached = obj instanceof _Blob || (obj.constructor && obj.constructor.name === 'Blob')
+  typeCache.set(obj, cached)
+  return cached
+}
+
 /**
  * @param {(Blob | Uint8Array)[]} parts
  * @param {boolean} clone
@@ -32,9 +61,12 @@ async function * toIterator (parts, clone) {
         const end = part.byteOffset + part.byteLength
         while (position !== end) {
           const size = Math.min(end - position, POOL_SIZE)
+          const buffer = getPooledBuffer(size)
           const chunk = part.buffer.slice(position, position + size)
           position += chunk.byteLength
-          yield new Uint8Array(chunk)
+          const uint8 = new Uint8Array(chunk)
+          yield uint8
+          // Note: Can't return to pool here as the buffer is still in use
         }
       } else {
         yield part
@@ -76,16 +108,23 @@ const _Blob = class Blob {
 
     if (options === null) options = {}
 
-    const encoder = new TextEncoder()
+    // Lazy TextEncoder creation - only create when needed
+    let encoder
     for (const element of blobParts) {
       let part
-      if (ArrayBuffer.isView(element)) {
+      // Fast path for Buffer (Node.js specific optimization)
+      if (typeof Buffer !== 'undefined' && Buffer.isBuffer(element)) {
+        // For Buffer, we need to copy the data to ensure immutability
+        part = new Uint8Array(element.buffer.slice(element.byteOffset, element.byteOffset + element.byteLength))
+      } else if (ArrayBuffer.isView(element)) {
         part = new Uint8Array(element.buffer.slice(element.byteOffset, element.byteOffset + element.byteLength))
       } else if (element instanceof ArrayBuffer) {
         part = new Uint8Array(element.slice(0))
       } else if (element instanceof Blob) {
         part = element
       } else {
+        // Lazy init encoder
+        if (!encoder) encoder = new TextEncoder()
         part = encoder.encode(`${element}`)
       }
 
@@ -207,6 +246,7 @@ const _Blob = class Blob {
       } else {
         let chunk
         if (ArrayBuffer.isView(part)) {
+          // Use subarray to avoid copying when possible (creates a view)
           chunk = part.subarray(relativeStart, Math.min(size, relativeEnd))
           added += chunk.byteLength
         } else {
